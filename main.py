@@ -6,8 +6,6 @@ import urllib.request
 from pathlib import Path
 
 import uno
-from com.sun.star.awt import FontWeight
-from com.sun.star.beans import PropertyValue
 
 
 def connect_to_libreoffice(host: str = "127.0.0.1", port: int = 2002):
@@ -43,53 +41,15 @@ def download_if_url(path_or_url: str) -> str:
     return path_or_url
 
 
-def _create_text_capable_shape(doc):
-    # TextShape can behave inconsistently across LibreOffice builds; fallback to RectangleShape.
-    for service_name in ("com.sun.star.drawing.TextShape", "com.sun.star.drawing.RectangleShape"):
-        shape = doc.createInstance(service_name)
-        if hasattr(shape, "setString") or hasattr(shape, "String"):
-            return shape
-    raise RuntimeError("Could not create a text-capable shape")
-
-
 def add_text_shape(doc, slide, block: dict):
-    text = _create_text_capable_shape(doc)
+    text = doc.createInstance("com.sun.star.drawing.TextShape")
     x, y = block.get("x", 2000), block.get("y", 2000)
     w, h = block.get("width", 18000), block.get("height", 3000)
     text.setPosition(point(x, y))
     text.setSize(size(w, h))
-
-    # Ensure text is visible and not clipped or hidden by style defaults
-    text.FillStyle = 0  # NONE
-    text.LineStyle = 0  # NONE
-    text.TextAutoGrowHeight = True
-    text.TextAutoGrowWidth = False
-    text.TextWordWrap = True
-
-    content = block.get("text", "")
-    if hasattr(text, "setString"):
-        text.setString(content)
-    else:
-        text.String = content
-
-    cursor = text.createTextCursor()
-    cursor.gotoStart(False)
-    cursor.gotoEnd(True)
-    cursor.CharHeight = float(block.get("font_size", 28))
-    cursor.CharColor = int(block.get("color", 0x000000))
-
-    if block.get("type") == "heading":
-        cursor.CharWeight = FontWeight.BOLD
-    elif block.get("type") == "subheading":
-        cursor.CharWeight = FontWeight.SEMIBOLD
-
+    text.String = block.get("text", "")
+    text.CharHeight = block.get("font_size", 28)
     slide.add(text)
-
-    # Ensure text stays above background elements.
-    try:
-        text.ZOrder = 1000
-    except Exception:
-        pass
 
 
 def add_image_shape(doc, slide, block: dict):
@@ -175,13 +135,7 @@ def generate_presentation_from_json(spec: dict, output_path: str, host: str, por
         apply_slide_content(doc, slide, slide_spec)
 
     output_url = uno.systemPathToFileUrl(str(Path(output_path).resolve()))
-
-    overwrite = PropertyValue()
-    overwrite.Name = "Overwrite"
-    overwrite.Value = True
-
-    # storeAsURL handles new save targets and existing files when overwrite is enabled
-    doc.storeAsURL(output_url, (overwrite,))
+    doc.storeToURL(output_url, ())
     doc.close(True)
 
 
