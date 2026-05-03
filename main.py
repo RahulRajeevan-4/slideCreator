@@ -1,76 +1,160 @@
+import argparse
+import json
+import os
+import tempfile
+import urllib.request
+from pathlib import Path
+
 import uno
-import time
 
-print("Connecting to LibreOffice...")
 
-# Connect
-local_ctx = uno.getComponentContext()
-resolver = local_ctx.ServiceManager.createInstanceWithContext(
-    "com.sun.star.bridge.UnoUrlResolver", local_ctx
-)
-
-ctx = resolver.resolve(
-    "uno:socket,host=127.0.0.1,port=2002;urp;StarOffice.ComponentContext"
-)
-
-print("Connected!")
-
-smgr = ctx.ServiceManager
-desktop = smgr.createInstanceWithContext(
-    "com.sun.star.frame.Desktop", ctx
-)
-
-# Create presentation
-doc = desktop.loadComponentFromURL(
-    "private:factory/simpress", "_blank", 0, ()
-)
-
-time.sleep(1)
-
-slides = doc.getDrawPages()
-slide = slides.getByIndex(0)
-
-# Ensure layout
-slide.setPropertyValue("Layout", 1)
-time.sleep(1)
-
-print("Total shapes on slide:", slide.getCount())
-
-text_set = False
-
-# Iterate shapes correctly
-for i in range(slide.getCount()):
-    shape = slide.getByIndex(i)
-
-    if shape.supportsService("com.sun.star.drawing.Text"):
-        shape.String = "HI"
-        shape.CharHeight = 80
-        print("Text inserted into existing shape")
-        text_set = True
-        break
-
-# Fallback
-if not text_set:
-    print("No text shape found, creating one...")
-
-    textbox = doc.createInstance("com.sun.star.drawing.TextShape")
-
-    textbox.setPosition(
-        uno.createUnoStruct("com.sun.star.awt.Point", 2000, 2000)
+def connect_to_libreoffice(host: str = "127.0.0.1", port: int = 2002):
+    local_ctx = uno.getComponentContext()
+    resolver = local_ctx.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", local_ctx
     )
-    textbox.setSize(
-        uno.createUnoStruct("com.sun.star.awt.Size", 20000, 8000)
+    ctx = resolver.resolve(
+        f"uno:socket,host={host},port={port};urp;StarOffice.ComponentContext"
+    )
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+    return desktop
+
+
+def point(x: int, y: int):
+    return uno.createUnoStruct("com.sun.star.awt.Point", x, y)
+
+
+def size(width: int, height: int):
+    return uno.createUnoStruct("com.sun.star.awt.Size", width, height)
+
+
+def download_if_url(path_or_url: str) -> str:
+    if path_or_url.startswith(("http://", "https://")):
+        suffix = Path(path_or_url).suffix or ".img"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        req = urllib.request.Request(path_or_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as response, open(tmp_path, "wb") as out_file:
+            out_file.write(response.read())
+        return tmp_path
+    return path_or_url
+
+
+def add_text_shape(doc, slide, block: dict):
+    text = doc.createInstance("com.sun.star.drawing.TextShape")
+    x, y = block.get("x", 2000), block.get("y", 2000)
+    w, h = block.get("width", 18000), block.get("height", 3000)
+    text.setPosition(point(x, y))
+    text.setSize(size(w, h))
+    text.String = block.get("text", "")
+    text.CharHeight = block.get("font_size", 28)
+    slide.add(text)
+
+
+def add_image_shape(doc, slide, block: dict):
+    image_path = download_if_url(block["path"])
+    image = doc.createInstance("com.sun.star.drawing.GraphicObjectShape")
+    x, y = block.get("x", 14000), block.get("y", 2000)
+    w, h = block.get("width", 7000), block.get("height", 7000)
+    image.setPosition(point(x, y))
+    image.setSize(size(w, h))
+    image.GraphicURL = uno.systemPathToFileUrl(str(Path(image_path).resolve()))
+    slide.add(image)
+
+
+def add_chart_shape(doc, slide, block: dict):
+    import matplotlib.pyplot as plt
+
+    chart = block.get("chart", {})
+    chart_type = chart.get("type", "bar")
+    labels = chart.get("labels", [])
+    values = chart.get("values", [])
+    title = chart.get("title", "")
+
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    if chart_type == "line":
+        ax.plot(labels, values, marker="o")
+    elif chart_type == "pie":
+        ax.pie(values, labels=labels, autopct="%1.1f%%")
+    else:
+        ax.bar(labels, values)
+
+    ax.set_title(title)
+    if chart_type != "pie":
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+
+    fd, chart_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    fig.savefig(chart_path, dpi=180)
+    plt.close(fig)
+
+    add_image_shape(
+        doc,
+        slide,
+        {
+            "path": chart_path,
+            "x": block.get("x", 2000),
+            "y": block.get("y", 8000),
+            "width": block.get("width", 12000),
+            "height": block.get("height", 7000),
+        },
     )
 
-    textbox.String = "HI"
-    textbox.CharHeight = 120
 
-    slide.add(textbox)
+def add_block(doc, slide, block: dict):
+    block_type = block.get("type")
+    if block_type in {"heading", "subheading", "paragraph", "text"}:
+        add_text_shape(doc, slide, block)
+    elif block_type == "image":
+        add_image_shape(doc, slide, block)
+    elif block_type == "chart":
+        add_chart_shape(doc, slide, block)
+    else:
+        raise ValueError(f"Unsupported block type: {block_type}")
 
-# Force refresh
-controller = doc.getCurrentController()
-frame = controller.getFrame()
-window = frame.getContainerWindow()
-window.invalidate(0)
 
-print("Done. The 'HI' better be there now.")
+def apply_slide_content(doc, slide, slide_spec: dict):
+    for block in slide_spec.get("blocks", []):
+        add_block(doc, slide, block)
+
+
+def generate_presentation_from_json(spec: dict, output_path: str, host: str, port: int):
+    desktop = connect_to_libreoffice(host=host, port=port)
+    doc = desktop.loadComponentFromURL("private:factory/simpress", "_blank", 0, ())
+
+    slides = doc.getDrawPages()
+    # Reuse first slide for first spec, add additional slides as needed
+    for i, slide_spec in enumerate(spec.get("slides", [])):
+        if i == 0:
+            slide = slides.getByIndex(0)
+        else:
+            slides.insertNewByIndex(i)
+            slide = slides.getByIndex(i)
+        apply_slide_content(doc, slide, slide_spec)
+
+    output_url = uno.systemPathToFileUrl(str(Path(output_path).resolve()))
+    doc.storeToURL(output_url, ())
+    doc.close(True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate LibreOffice Impress slides from a JSON specification."
+    )
+    parser.add_argument("input_json", help="Path to JSON slide spec")
+    parser.add_argument("-o", "--output", default="generated_presentation.odp")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=2002)
+    args = parser.parse_args()
+
+    with open(args.input_json, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+
+    generate_presentation_from_json(spec, args.output, args.host, args.port)
+    print(f"Presentation generated at: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
